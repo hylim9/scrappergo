@@ -8,8 +8,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	ccsv "github.com/tsak/concurrent-csv-writer"
 )
 
 type extractedJob struct {
@@ -18,19 +20,94 @@ type extractedJob struct {
 	condition string
 }
 
-var baseURL string = "https://www.saramin.co.kr/zf_user/search/recruit?searchword=django"
+var searchWord string = "python"
+var baseURL string = "https://www.saramin.co.kr/zf_user/search/recruit?searchword=" + searchWord
 
 func main() {
+	start := time.Now()
 	var jobs []extractedJob
+	c := make(chan []extractedJob)
 	totalPages := getPages()
 	
 	for i := 0; i < totalPages; i++ {
-		extractedJobs := getPage(i)
-		jobs = append(jobs, extractedJobs...) // [x, x, x] not [[x], [x], [x]]
-
+		go getPage(i, c)
 	}
-	writeJobs(jobs)
-	fmt.Println("파일 생성 완료")
+
+	for i := 0; i < totalPages; i++ {
+		extractedJobs := <-c
+		jobs = append(jobs, extractedJobs...) // [x, x, x] not [[x], [x], [x]]
+	}
+
+	// 개수가 적으면 크게 차이가 나지 않음? 대량으로 테스트 필요
+	// writeJobs(jobs)
+	writeJobsConcurrent(jobs)
+
+	elapsed := time.Since(start)
+	fmt.Println(elapsed)
+	fmt.Println("파일 생성 완료, " + strconv.Itoa(len(jobs)) + " 개 포지션 수집 됨")
+}
+
+func getPage(page int, mainC chan<- []extractedJob) {
+	var jobs []extractedJob
+	c := make(chan extractedJob)
+	pageUrl := baseURL + "&recruitPage=" + strconv.Itoa(page+1)
+	fmt.Println("Requesting: ", pageUrl)
+	res, err := http.Get(pageUrl)
+	checkErr(err)
+	checkStatusCode(res)
+
+	defer res.Body.Close()
+
+	doc, err := goquery.NewDocumentFromReader(res.Body)
+	checkErr(err)
+
+	searchCards := doc.Find(".item_recruit")
+	searchCards.Each(func(i int, card *goquery.Selection) {
+		// job := extractJob(card, c)
+		// jobs = append(jobs, job)
+		go extractJob(card, c)
+	})
+
+	for i := 0; i < searchCards.Length(); i++ {
+		job := <-c
+		jobs = append(jobs, job)
+	}
+
+	mainC <- jobs
+}
+
+func extractJob(card *goquery.Selection, c chan<- extractedJob) {
+	id, _ := card.Attr("value")
+	title := cleanString(card.Find(".job_tit>a").Text())
+	condition := cleanString(card.Find(".job_condition").Text())
+	// fmt.Println(id, title, condition)
+	c <- extractedJob{
+		id: id, 
+		title: title, 
+		condition: condition,
+	}
+}
+
+func cleanString(str string) string {
+	// Fields 문자열을 분리 , TrimSpace 양쪽 끝에 공백을 제거, Join 배열을 separater 기준 join
+	return strings.Join(strings.Fields(strings.TrimSpace(str)), " ")
+}
+
+func getPages() int {
+	pages := 0
+	res, err := http.Get(baseURL)
+	checkErr(err)
+	checkStatusCode(res)
+
+	defer res.Body.Close() // 메모리 샘 방지
+	// Load the HTML document
+	doc, err := goquery.NewDocumentFromReader(res.Body)
+	checkErr(err)
+    
+	doc.Find(".pagination").Each(func(i int, s *goquery.Selection) {
+		pages = s.Find("a").Length()
+	})
+	return pages
 }
 
 func writeJobs(jobs []extractedJob) {
@@ -53,59 +130,30 @@ func writeJobs(jobs []extractedJob) {
 
 }
 
-func getPage(page int) []extractedJob {
-	var jobs []extractedJob
-	pageUrl := baseURL + "&recruitPage=" + strconv.Itoa(page+1)
-	fmt.Println("Requesting: ", pageUrl)
-	res, err := http.Get(pageUrl)
-	checkErr(err)
-	checkStatusCode(res)
 
-	defer res.Body.Close()
-
-	doc, err := goquery.NewDocumentFromReader(res.Body)
+func writeJobsConcurrent(jobs []extractedJob) {
+	csv, err := ccsv.NewCsvWriter("jobs.csv")
 	checkErr(err)
 
-	searchCards := doc.Find(".item_recruit")
-	searchCards.Each(func(i int, card *goquery.Selection) {
-		job := extractJob(card)
-		jobs = append(jobs, job)
-	})
+	defer csv.Close()
 
-	return jobs
-}
+	headers := []string{"ID", "Title", "Condition"}
 
-func extractJob(card *goquery.Selection) extractedJob {
-	id, _ := card.Attr("value")
-	title := cleanString(card.Find(".job_tit>a").Text())
-	condition := cleanString(card.Find(".job_condition").Text())
-	// fmt.Println(id, title, condition)
-	return extractedJob{
-		id: id, 
-		title: title, 
-		condition: condition,
+	wErr := csv.Write(headers)
+	checkErr(wErr)
+
+	done := make(chan bool)
+
+	for _, job := range jobs {
+		go func(job extractedJob) {
+			csv.Write([]string{"https://www.saramin.co.kr/zf_user/jobs/relay/view?rec_idx=" + job.id, job.title, job.condition})
+			done <- true
+		}(job)
 	}
-}
 
-func cleanString(str string) string {
-	return strings.Join(strings.Fields(strings.TrimSpace(str)), " ")
-}
-
-func getPages() int {
-	pages := 0
-	res, err := http.Get(baseURL)
-	checkErr(err)
-	checkStatusCode(res)
-
-	defer res.Body.Close() // 메모리 샘 방지
-	// Load the HTML document
-	doc, err := goquery.NewDocumentFromReader(res.Body)
-	checkErr(err)
-    
-	doc.Find(".pagination").Each(func(i int, s *goquery.Selection) {
-		pages = s.Find("a").Length()
-	})
-	return pages
+	for i := 0; i < len(jobs); i++ {
+		<-done
+	}
 }
 
 func checkErr(err error) {
